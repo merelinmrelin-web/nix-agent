@@ -72,16 +72,16 @@ You need Nix with flakes enabled (`experimental-features = nix-command flakes`).
 Start read-only and unprivileged. This generates and validates a module and prints it. It does **not** change your system:
 
 ```bash
-nix run github:youruser/nix-agent -- plan "add tmux with vi-style keybindings"
+nix run github:merelinmrelin-web/nix-agent -- plan "add tmux with vi-style keybindings"
 ```
 
 Review the printed module and the plan file (`./.nix-agent-plan.nix`). When you're satisfied, apply it deliberately:
 
 ```bash
-sudo nix run github:youruser/nix-agent -- apply --plan <plan-id>
+sudo nix run github:merelinmrelin-web/nix-agent -- apply --plan <plan-id>
 ```
 
-Replace `youruser` with the actual repo owner. On first use the local option index is empty; see [Usage](#usage) for the one-time ingest step that makes generation useful.
+
 
 ---
 
@@ -138,7 +138,7 @@ For a persistent install, add it as a flake input:
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nix-agent.url = "github:youruser/nix-agent";
+    nix-agent.url = "github:merelinmrelin-web/nix-agent";
   };
 
   outputs = { nixpkgs, nix-agent, ... }: {
