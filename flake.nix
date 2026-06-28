@@ -54,7 +54,7 @@
 
           meta = with pkgs.lib; {
             description = "Local, air-gapped AI agent for declarative NixOS configuration mutation and self-healing";
-            homepage = "https://github.com/youruser/nix-agent";
+            homepage = "https://github.com/merelinmrelin-web/nix-agent";
             license = licenses.mit;
             mainProgram = "nix-agent";
             platforms = [ "x86_64-linux" "aarch64-linux" ];
@@ -65,7 +65,7 @@
         packages.default = nix-agent;
         packages.nix-agent = nix-agent;
 
-        # Enables `nix run github:youruser/nix-agent -- run "..."`.
+        # Enables `nix run github:merelinmrelin-web/nix-agent -- run "..."`.
         apps.default = flake-utils.lib.mkApp {
           drv = nix-agent;
           name = "nix-agent";
