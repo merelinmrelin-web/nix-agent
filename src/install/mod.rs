@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 use rnix::ast::{Expr, Param};
 use rowan::ast::AstNode;
 
-use crate::execution::{parse_build_stderr, BuildMode, EngineError, NixBuildError, SystemBuilder};
+use crate::execution::{
+    parse_build_stderr, BuildMode, BuildOutput, EngineError, NixBuildError, SystemBuilder,
+};
 use crate::plan::Plan;
 
 /// Default system configuration directory for non-flake NixOS.
@@ -34,6 +36,9 @@ pub const DEFAULT_CONFIG_DIR: &str = "/etc/nixos";
 pub const AGGREGATOR_IMPORT: &str = "./modules/ai-generated";
 /// The canonical module function header injected when wrapping bare attrsets.
 pub const MODULE_HEADER: &str = "{ config, pkgs, lib, ... }:";
+/// How many autonomous repair cycles the self-healing loop attempts before it
+/// gives up and rolls back.
+pub const MAX_REPAIR_ATTEMPTS: usize = 3;
 
 // ── System apply configuration ──────────────────────────────────────────────
 
@@ -124,6 +129,8 @@ pub enum InstallError {
     },
     /// Infrastructure failure spawning/awaiting the rebuild.
     Engine(EngineError),
+    /// The self-healing backend failed to produce a replacement module.
+    Repair(anyhow::Error),
 }
 
 impl std::fmt::Display for InstallError {
@@ -162,6 +169,7 @@ impl std::fmt::Display for InstallError {
                 Ok(())
             }
             Self::Engine(e) => write!(f, "{e}"),
+            Self::Repair(e) => write!(f, "self-healing regeneration failed: {e}"),
         }
     }
 }
@@ -174,6 +182,49 @@ impl std::error::Error for InstallError {
             _ => None,
         }
     }
+}
+
+// ── Self-healing seam ───────────────────────────────────────────────────────
+
+/// Regenerates a corrected module from the failed source and the build error.
+/// Implemented by an adapter over the local LLM backend; mocked in tests so the
+/// healing loop is exercised without inference.
+#[allow(async_fn_in_trait)]
+pub trait ModuleRepairer {
+    async fn repair(&mut self, failed_module: &str, stderr: &str) -> anyhow::Result<String>;
+}
+
+/// Build the strict, prose-free repair prompt fed to the inference backend. The
+/// backend wraps this in its own ChatML template before generation.
+pub fn build_repair_prompt(failed_module: &str, stderr: &str) -> String {
+    format!(
+        "[SYSTEM] You are an expert NixOS fixer. The module you just generated failed to compile.\n\
+         [ERROR] {stderr}\n\
+         [SOURCE] {failed_module}\n\
+         Fix the error by regenerating the valid Nix module code. Maintain the exact required \
+         function header structure. Do not include prose."
+    )
+}
+
+/// Progress emitted by the self-healing loop, so a front-end can show the
+/// `[Self-Healing]` lines without the loop owning any UI.
+#[derive(Debug)]
+pub enum RepairEvent {
+    /// A rebuild failed; repair `attempt`/`max` is about to start.
+    Attempt {
+        attempt: usize,
+        max: usize,
+        error: Option<Box<NixBuildError>>,
+    },
+    /// A regenerated module passed the AST gate and is being re-built.
+    Rebuilding { attempt: usize },
+}
+
+/// What [`activate`] did on success.
+#[derive(Debug, Clone, Default)]
+pub struct ActivateReport {
+    /// Number of autonomous repair cycles it took (0 = built first try).
+    pub healing_attempts: usize,
 }
 
 // ── Module normalization ────────────────────────────────────────────────────
@@ -558,6 +609,13 @@ pub struct RegisterReport {
     /// Prior installed module contents, if this id was already applied.
     pub module_prior: Option<String>,
     pub aggregator_change: AggregatorChange,
+    /// Plan id + prompt, kept so the self-healing loop can re-render the module's
+    /// provenance header after a regeneration.
+    pub plan_id: String,
+    pub prompt: String,
+    /// The normalized module body that was installed (no provenance header) —
+    /// the starting point for the first repair prompt.
+    pub normalized_source: String,
 }
 
 /// Phase 2 of apply: normalize, verify the root config, write the module, and
@@ -577,7 +635,10 @@ pub fn register_module(
 
     let module_path = cfg.module_path_for(&plan.id);
     let module_prior = read_opt(&module_path)?;
-    atomic_write(&module_path, &with_provenance(plan, &normalized))?;
+    atomic_write(
+        &module_path,
+        &render_module(&plan.id, &plan.prompt, &normalized),
+    )?;
 
     let aggregator_change = register_in_aggregator(&cfg.aggregator_path, &plan.id)?;
 
@@ -588,27 +649,102 @@ pub fn register_module(
         packages,
         module_prior,
         aggregator_change,
+        plan_id: plan.id.clone(),
+        prompt: plan.prompt.clone(),
+        normalized_source: normalized,
     })
 }
 
-/// Phase 3 of apply: run the rebuild. On failure, roll back the aggregator and
-/// move the freshly-written module aside, then return a parsed error. Never
-/// reports success on a failed rebuild.
-pub async fn activate<B: SystemBuilder>(
+/// Phase 3 of apply: run the rebuild with an autonomous self-healing loop.
+///
+/// On a failed `nixos-rebuild test`, instead of rolling back immediately, the
+/// build error is fed back to the inference backend (via `repairer`), the
+/// regenerated module is re-normalized + AST-gated, rewritten, and re-built —
+/// up to [`MAX_REPAIR_ATTEMPTS`] times. Only if every repair fails is the
+/// transactional rollback executed (aggregator restored, broken module moved to
+/// `failed/`) and a terminal error returned. Never reports success on a failed
+/// rebuild.
+pub async fn activate<B, R>(
     cfg: &NixosApplyConfig,
     builder: &B,
+    repairer: &mut R,
     reg: &RegisterReport,
-) -> Result<(), InstallError> {
-    let output = builder
+    mut on_event: impl FnMut(RepairEvent),
+) -> Result<ActivateReport, InstallError>
+where
+    B: SystemBuilder,
+    R: ModuleRepairer,
+{
+    // The currently-installed module body (no provenance), starting from what
+    // `register_module` wrote and updated after each successful regeneration.
+    let mut module = reg.normalized_source.clone();
+    let mut output = builder
         .build(&reg.module_path)
         .await
         .map_err(InstallError::Engine)?;
+    let mut repairs = 0usize;
 
-    if output.success {
-        return Ok(());
+    while !output.success {
+        if repairs >= MAX_REPAIR_ATTEMPTS {
+            // Exhausted: transactional rollback + terminal failure.
+            rollback(cfg, reg)?;
+            return Err(InstallError::Rebuild {
+                parsed: parse_build_stderr(&output.stderr).map(Box::new),
+                stderr: output.stderr,
+            });
+        }
+
+        repairs += 1;
+        on_event(RepairEvent::Attempt {
+            attempt: repairs,
+            max: MAX_REPAIR_ATTEMPTS,
+            error: parse_build_stderr(&output.stderr).map(Box::new),
+        });
+
+        // Ask the backend for a corrected module.
+        let raw = repairer
+            .repair(&module, &output.stderr)
+            .await
+            .map_err(InstallError::Repair)?;
+
+        match normalize_module(&raw) {
+            Ok(fixed) => {
+                // Passed the AST gate: install it and re-build.
+                atomic_write(
+                    &reg.module_path,
+                    &render_module(&reg.plan_id, &reg.prompt, &fixed),
+                )?;
+                module = fixed;
+                on_event(RepairEvent::Rebuilding { attempt: repairs });
+                output = builder
+                    .build(&reg.module_path)
+                    .await
+                    .map_err(InstallError::Engine)?;
+            }
+            Err(InstallError::Normalize(msg)) => {
+                // Regeneration didn't even parse. Keep the old module on disk and
+                // synthesize a failure so the next repair prompt sees this; the
+                // loop stays bounded by `repairs`.
+                output = BuildOutput {
+                    success: false,
+                    exit_code: Some(1),
+                    stdout: String::new(),
+                    stderr: format!("error: regenerated module did not pass the AST gate: {msg}"),
+                };
+            }
+            Err(e) => return Err(e),
+        }
     }
 
-    // Roll back: restore aggregator, then restore/quarantine the module.
+    Ok(ActivateReport {
+        healing_attempts: repairs,
+    })
+}
+
+/// Transactional rollback used when self-healing is exhausted: restore the
+/// aggregator to its pre-apply state, then restore the prior module (re-apply)
+/// or quarantine the broken one (first apply).
+fn rollback(cfg: &NixosApplyConfig, reg: &RegisterReport) -> Result<(), InstallError> {
     restore_aggregator(&reg.aggregator_path, &reg.aggregator_change)?;
     match &reg.module_prior {
         Some(prior) => atomic_write(&reg.module_path, prior)?,
@@ -616,11 +752,7 @@ pub async fn activate<B: SystemBuilder>(
             quarantine_module(cfg, &reg.module_path)?;
         }
     }
-
-    Err(InstallError::Rebuild {
-        parsed: parse_build_stderr(&output.stderr).map(Box::new),
-        stderr: output.stderr,
-    })
+    Ok(())
 }
 
 /// Move a failed module into `<generated>/failed/<name>` so it is out of the
@@ -641,14 +773,13 @@ fn quarantine_module(cfg: &NixosApplyConfig, module_path: &Path) -> Result<PathB
 }
 
 /// Prepend a short, declarative provenance comment (valid Nix) to the module.
-fn with_provenance(plan: &Plan, module: &str) -> String {
+fn render_module(plan_id: &str, prompt: &str, module: &str) -> String {
     format!(
         "# Generated by nix-agent — do not edit by hand.\n\
-         # plan-id: {id}\n\
+         # plan-id: {plan_id}\n\
          # prompt: {prompt}\n\n\
          {module}",
-        id = plan.id,
-        prompt = plan.prompt.replace('\n', " "),
+        prompt = prompt.replace('\n', " "),
     )
 }
 

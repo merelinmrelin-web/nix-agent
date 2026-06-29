@@ -574,6 +574,9 @@ mod embedded {
                 let chunk_end = (chunk_start + prompt_batch_size).min(tokens.len());
                 let mut prompt_batch = LlamaBatch::new(prompt_batch_size, 1);
 
+                // `i` is both the token index and its absolute KV-cache position
+                // (`i as i32`), so an index loop is required here — not a bug.
+                #[allow(clippy::needless_range_loop)]
                 for i in chunk_start..chunk_end {
                     let is_last = i == last_global;
                     prompt_batch.add(tokens[i], i as i32, &[0], is_last)?;
@@ -876,7 +879,10 @@ fn describe_failure(ctx: &HealingContext) -> String {
 }
 
 /// Strip a leading ```/```nix fence and trailing ``` a model may wrap output in.
-fn strip_code_fences(s: &str) -> String {
+/// Strip a single leading/trailing Markdown code fence (```nix … ```), if the
+/// model wrapped its output in one. Used by both first-draft generation and the
+/// self-healing repair path.
+pub fn strip_code_fences(s: &str) -> String {
     let t = s.trim();
     if let Some(rest) = t.strip_prefix("```") {
         let body = rest.split_once('\n').map(|x| x.1).unwrap_or("");

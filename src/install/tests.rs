@@ -40,6 +40,43 @@ impl SystemBuilder for ScriptedBuilder {
     }
 }
 
+// A builder that replays a queue of outcomes (for the self-healing loop).
+struct QueueBuilder {
+    outputs: std::sync::Mutex<std::collections::VecDeque<BuildOutput>>,
+}
+impl QueueBuilder {
+    fn new(outputs: Vec<BuildOutput>) -> Self {
+        Self {
+            outputs: std::sync::Mutex::new(outputs.into()),
+        }
+    }
+}
+impl SystemBuilder for QueueBuilder {
+    async fn build(&self, _staging_path: &Path) -> Result<BuildOutput, EngineError> {
+        Ok(self
+            .outputs
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("QueueBuilder ran out of scripted outputs"))
+    }
+}
+
+// A repairer that replays a fixed reply, counting how often it is consulted.
+struct MockRepairer {
+    reply: String,
+    calls: usize,
+}
+impl ModuleRepairer for MockRepairer {
+    async fn repair(&mut self, _failed: &str, _stderr: &str) -> anyhow::Result<String> {
+        self.calls += 1;
+        Ok(self.reply.clone())
+    }
+}
+
+const REPAIRED: &str =
+    "{ config, pkgs, lib, ... }:\n{\n  programs.tmux.enable = true; # repaired-by-healer\n}\n";
+
 fn ok_build() -> BuildOutput {
     BuildOutput {
         success: true,
@@ -280,9 +317,51 @@ async fn register_then_activate_succeeds() {
         .contains("./2026-06-29-ripgrep-fd.nix"));
 
     let builder = ScriptedBuilder { output: ok_build() };
-    activate(&cfg, &builder, &reg).await.unwrap();
-    // Module still installed after a successful activation.
+    let mut repairer = MockRepairer {
+        reply: String::new(),
+        calls: 0,
+    };
+    let report = activate(&cfg, &builder, &mut repairer, &reg, |_| {})
+        .await
+        .unwrap();
+    // Built first try: no healing, repairer never consulted.
+    assert_eq!(report.healing_attempts, 0);
+    assert_eq!(repairer.calls, 0);
     assert!(reg.module_path.exists());
+}
+
+#[tokio::test]
+async fn activate_self_heals_on_second_attempt() {
+    let dir = TempDir::new("flow-heal");
+    let cfg = config_with_root_import(&dir.path);
+    let reg = register_module(&cfg, &plan("2026-06-29-heal", BARE_ATTRSET)).unwrap();
+
+    // First rebuild fails, the regenerated module then builds clean.
+    let builder = QueueBuilder::new(vec![fail_build(), ok_build()]);
+    let mut repairer = MockRepairer {
+        reply: REPAIRED.to_owned(),
+        calls: 0,
+    };
+
+    let report = activate(&cfg, &builder, &mut repairer, &reg, |_| {})
+        .await
+        .unwrap();
+
+    assert_eq!(report.healing_attempts, 1);
+    assert_eq!(repairer.calls, 1);
+    // The module on disk is the healed version (and keeps its provenance header).
+    let body = std::fs::read_to_string(&reg.module_path).unwrap();
+    assert!(body.contains("repaired-by-healer"));
+    assert!(body.contains("# plan-id: 2026-06-29-heal"));
+}
+
+#[test]
+fn repair_prompt_carries_error_and_source() {
+    let p = build_repair_prompt("MODULE_BODY", "STDERR_BLOB");
+    assert!(p.contains("[ERROR] STDERR_BLOB"));
+    assert!(p.contains("[SOURCE] MODULE_BODY"));
+    assert!(p.contains("Do not include prose"));
+    assert!(p.contains("expert NixOS fixer"));
 }
 
 #[tokio::test]
@@ -300,14 +379,21 @@ async fn activate_failure_rolls_back_and_reports_no_success() {
     let reg = register_module(&cfg, &plan("2026-06-29-broken", BARE_ATTRSET)).unwrap();
     assert!(reg.module_path.exists());
 
+    // Every rebuild fails; the healer keeps producing parseable-but-still-broken
+    // modules, so all 3 repair cycles are spent before the terminal rollback.
     let builder = ScriptedBuilder {
         output: fail_build(),
     };
-    let result = activate(&cfg, &builder, &reg).await;
+    let mut repairer = MockRepairer {
+        reply: REPAIRED.to_owned(),
+        calls: 0,
+    };
+    let result = activate(&cfg, &builder, &mut repairer, &reg, |_| {}).await;
 
-    // No success: an error is returned.
+    // No success: a terminal error is returned only after exhausting repairs.
     let err = result.unwrap_err();
     assert!(matches!(err, InstallError::Rebuild { .. }));
+    assert_eq!(repairer.calls, 3);
 
     // Aggregator restored to its prior state (no broken import).
     let agg = std::fs::read_to_string(&cfg.aggregator_path).unwrap();

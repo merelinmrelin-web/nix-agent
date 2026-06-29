@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod chat;
 pub mod config;
 pub mod execution;
 pub mod install;

@@ -15,8 +15,88 @@ use clap::{Parser, Subcommand};
 
 use nix_agent::config::{AppConfig, HardwareTier};
 use nix_agent::execution::{AstOnlyBuilder, NixosRebuild};
+use nix_agent::install::ModuleRepairer;
 use nix_agent::plan::{self, Plan, PlanOutcome};
-use nix_agent::rag::{LocalLlmHealer, NixOptionIndex};
+use nix_agent::rag::{LlmBackend, LocalLlmHealer, NixOptionIndex};
+
+/// Adapter turning the local LLM backend into an [`install::ModuleRepairer`] for
+/// the self-healing loop. The embedded model is loaded lazily — only the first
+/// time a repair is actually needed — so a clean apply never pays the load cost.
+enum AppRepairer {
+    #[cfg(not(feature = "embedded-llm"))]
+    Stub(nix_agent::rag::StubBackend),
+    #[cfg(feature = "embedded-llm")]
+    Embedded {
+        tier: HardwareTier,
+        cache_dir: PathBuf,
+        model: Option<nix_agent::rag::EmbeddedLlamaBackend>,
+    },
+}
+
+impl ModuleRepairer for AppRepairer {
+    async fn repair(&mut self, failed_module: &str, stderr: &str) -> anyhow::Result<String> {
+        let prompt = nix_agent::install::build_repair_prompt(failed_module, stderr);
+        let raw = match self {
+            #[cfg(not(feature = "embedded-llm"))]
+            AppRepairer::Stub(b) => b.complete(&prompt).await?,
+            #[cfg(feature = "embedded-llm")]
+            AppRepairer::Embedded {
+                tier,
+                cache_dir,
+                model,
+            } => {
+                if model.is_none() {
+                    ui::detail("Loading local model for self-healing...");
+                    *model = Some(load_healing_backend(*tier, cache_dir)?);
+                }
+                model
+                    .as_ref()
+                    .expect("model loaded above")
+                    .complete(&prompt)
+                    .await?
+            }
+        };
+        Ok(nix_agent::rag::strip_code_fences(&raw))
+    }
+}
+
+/// Build the repairer for `apply`. Real inference is wired only under
+/// `embedded-llm`; otherwise the offline stub stands in.
+fn make_repairer(cfg: &AppConfig) -> AppRepairer {
+    let _ = cfg;
+    #[cfg(feature = "embedded-llm")]
+    {
+        AppRepairer::Embedded {
+            tier: HardwareTier::detect(),
+            cache_dir: cfg.model_cache_dir.clone(),
+            model: None,
+        }
+    }
+    #[cfg(not(feature = "embedded-llm"))]
+    {
+        AppRepairer::Stub(nix_agent::rag::StubBackend)
+    }
+}
+
+/// Lazily resolve a GGUF for self-healing using the same air-gapped search as
+/// `plan` (discovered local models first, else the hardware-tier download),
+/// without any interactive selection.
+#[cfg(feature = "embedded-llm")]
+fn load_healing_backend(
+    tier: HardwareTier,
+    cache_dir: &Path,
+) -> anyhow::Result<nix_agent::rag::EmbeddedLlamaBackend> {
+    use nix_agent::rag::EmbeddedLlamaBackend;
+
+    if let Ok(found) = nix_agent::models::discover() {
+        if let Some(model) = found.first() {
+            return EmbeddedLlamaBackend::load_from_path(tier, &model.path)
+                .context("could not load discovered model for self-healing");
+        }
+    }
+    EmbeddedLlamaBackend::load(tier, cache_dir, ui::progress)
+        .context("could not load the hardware-tier model for self-healing")
+}
 
 #[derive(Parser)]
 #[command(
@@ -56,6 +136,13 @@ enum Command {
     Models {
         #[command(subcommand)]
         action: ModelsCmd,
+    },
+    /// Interactive REPL: iterate on the system config conversationally, then
+    /// `apply` to deploy with self-healing.
+    Chat {
+        /// Path to a specific GGUF model (otherwise auto-discovered).
+        #[arg(long)]
+        model: Option<PathBuf>,
     },
 }
 
@@ -98,6 +185,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             ModelsCmd::List => cmd_models_list(),
             ModelsCmd::Pull { target } => cmd_models_pull(&target),
         },
+        Command::Chat { model } => cmd_chat(&cfg, model.as_deref()).await,
     }
 }
 
@@ -416,11 +504,19 @@ async fn cmd_apply(cfg: &AppConfig, plan_arg: &str) -> anyhow::Result<()> {
     rebuild.use_sudo = !is_root;
     rebuild.timeout = cfg.build_timeout;
 
-    install::activate(&apply_cfg, &rebuild, &reg)
+    let mut repairer = make_repairer(cfg);
+    let report = install::activate(&apply_cfg, &rebuild, &mut repairer, &reg, ui::heal_report)
         .await
-        .context("nixos-rebuild failed; system left unchanged")?;
+        .context("nixos-rebuild failed after self-healing; system left unchanged")?;
     ui::success("Temporarily activated via nixos-rebuild test");
     ui::detail("(`test` activates now but is NOT the boot-default generation)");
+    if report.healing_attempts > 0 {
+        ui::detail(&format!(
+            "(self-healed after {} repair attempt{})",
+            report.healing_attempts,
+            plural(report.healing_attempts)
+        ));
+    }
 
     // ── Postcondition: expected binaries appeared on PATH ──────────────────
     let probe = install::FsBinaryProbe::default();
@@ -451,6 +547,199 @@ fn running_as_root() -> bool {
     #[cfg(not(unix))]
     {
         false
+    }
+}
+
+// ── chat REPL ───────────────────────────────────────────────────────────────
+
+/// `chat` — open a persistent, conversational system-iteration session.
+async fn cmd_chat(cfg: &AppConfig, model: Option<&Path>) -> anyhow::Result<()> {
+    use nix_agent::install::NixosApplyConfig;
+
+    ui::banner();
+
+    // Context awareness: read the live root config + generated-modules aggregator.
+    let apply_cfg = NixosApplyConfig::resolve();
+    let ctx = nix_agent::chat::read_system_context(&apply_cfg);
+    ui::detail(&format!(
+        "Root config: {} ({})",
+        apply_cfg.root_config_path.display(),
+        present(ctx.root_present())
+    ));
+    ui::detail(&format!(
+        "Aggregator: {} ({})",
+        apply_cfg.aggregator_path.display(),
+        present(ctx.aggregator_present())
+    ));
+
+    let index = NixOptionIndex::open(&cfg.rag_db_path)?;
+    index.bootstrap()?;
+    if index.count()? == 0 {
+        ui::warn("Local RAG index is empty — run `nix-agent ingest <options.json>` first.");
+    }
+
+    let tier = HardwareTier::detect();
+
+    #[cfg(feature = "embedded-llm")]
+    {
+        let backend = load_inference_backend(cfg, tier, model)?;
+        ui::detail(&format!("Model ready: {}", backend.model_path().display()));
+        let healer = LocalLlmHealer::with_backend(index, backend);
+        run_chat_loop(cfg, healer).await
+    }
+    #[cfg(not(feature = "embedded-llm"))]
+    {
+        let _ = (model, tier);
+        ui::detail("Inference: offline stub backend (build with `--features embedded-llm`)");
+        let healer = LocalLlmHealer::with_backend(index, nix_agent::rag::StubBackend);
+        run_chat_loop(cfg, healer).await
+    }
+}
+
+fn present(yes: bool) -> &'static str {
+    if yes {
+        "found"
+    } else {
+        "missing"
+    }
+}
+
+/// The conversational loop, generic over the inference backend. Accumulates
+/// instructions into an in-memory staging plan, re-rendering a colored diff each
+/// turn, and deploys via the existing `apply` workflow on `apply`.
+async fn run_chat_loop<B: LlmBackend>(
+    cfg: &AppConfig,
+    mut healer: LocalLlmHealer<B>,
+) -> anyhow::Result<()> {
+    use nix_agent::chat::{self, ChatCommand};
+
+    chat_help();
+    let mut session = chat::ChatSession::new();
+    let stdin = std::io::stdin();
+
+    loop {
+        ui::chat_prompt();
+        let mut line = String::new();
+        if stdin.read_line(&mut line)? == 0 {
+            println!();
+            break; // EOF (Ctrl-D)
+        }
+
+        match chat::parse_command(&line) {
+            ChatCommand::Empty => continue,
+            ChatCommand::Help => chat_help(),
+            ChatCommand::Quit => {
+                ui::detail("Leaving chat. Nothing was deployed.");
+                break;
+            }
+            ChatCommand::Reset => {
+                session.reset();
+                ui::detail("Staging cleared.");
+            }
+            ChatCommand::Diff => {
+                if session.has_staged() {
+                    nix_agent::ui::diff::render_diff("", session.staged());
+                } else {
+                    ui::detail("Nothing staged yet — give an instruction first.");
+                }
+            }
+            ChatCommand::Instruction(text) => {
+                session.add_instruction(&text);
+                ui::detail("Thinking...");
+                match healer.draft(&session.session_prompt()).await {
+                    Ok(module) => {
+                        let previous = session.staged().to_owned();
+                        session.set_staged(module.clone());
+                        // Dynamic diff of how the staged module changed this turn.
+                        nix_agent::ui::diff::render_diff(&previous, &module);
+                    }
+                    Err(e) => ui::failure(&format!("generation failed: {e:#}")),
+                }
+            }
+            ChatCommand::Apply => {
+                if !session.has_staged() {
+                    ui::warn("Nothing staged to apply yet.");
+                    continue;
+                }
+                run_apply_from_session(cfg, &mut healer, &session).await?;
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn chat_help() {
+    ui::hint("Commands: <instruction> · diff · apply · reset · help · quit");
+}
+
+/// Validate the staged module through the AST gate (self-healing on parse
+/// errors), persist it as a plan, then launch the real `apply` workflow — which
+/// self-escalates and runs the autonomous self-healing rebuild loop.
+async fn run_apply_from_session<B: LlmBackend>(
+    cfg: &AppConfig,
+    healer: &mut LocalLlmHealer<B>,
+    session: &nix_agent::chat::ChatSession,
+) -> anyhow::Result<()> {
+    let prompt = session.session_prompt();
+    let plan_id = plan::make_plan_id(&prompt, plan::now_unix());
+
+    ui::step(1, 1, "Validating staged module (AST gate)...");
+    let outcome = plan::create_plan(
+        cfg,
+        &prompt,
+        &plan_id,
+        session.staged().to_owned(),
+        healer,
+        AstOnlyBuilder,
+        ui::heal_event,
+    )
+    .await
+    .context("failed to validate the staged module")?;
+
+    match outcome {
+        PlanOutcome::Validated { plan, attempts } => {
+            ui::success(&format!(
+                "Plan staged & validated: {} ({} attempt{})",
+                plan.id,
+                attempts,
+                plural(attempts)
+            ));
+            ui::detail("Launching apply (will request sudo if needed)...");
+            spawn_apply(&plan.id);
+        }
+        PlanOutcome::Rejected { reason, attempts } => {
+            ui::failure(&format!(
+                "Could not validate the staged module after {attempts} attempt{}: {reason}",
+                plural(attempts)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Launch `nix-agent apply --plan <id>` as a child process, inheriting stdio so
+/// its interactive diff/confirm and self-healing output work. Re-invokes the
+/// agent as it was launched (preserving any Vulkan wrapper on `PATH`); the child
+/// self-escalates via sudo when not already root.
+fn spawn_apply(plan_id: &str) {
+    use std::process::{Command, Stdio};
+
+    let program =
+        std::env::args_os().next().unwrap_or_else(|| std::ffi::OsString::from("nix-agent"));
+    let result = Command::new(program)
+        .arg("apply")
+        .arg("--plan")
+        .arg(plan_id)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+
+    match result {
+        Ok(status) if status.success() => {}
+        Ok(_) => ui::warn("apply exited with a non-zero status; system left unchanged."),
+        Err(e) => ui::failure(&format!("failed to launch `nix-agent apply`: {e}")),
     }
 }
 
@@ -511,6 +800,13 @@ mod ui {
         println!("      {}", msg.dark_grey());
     }
 
+    /// Print the REPL input prompt (no trailing newline) and flush.
+    pub fn chat_prompt() {
+        use std::io::Write;
+        print!("\n{} ", "nix-agent ❯".cyan().bold());
+        std::io::stdout().flush().ok();
+    }
+
     /// Model-download / first-run progress, printed verbatim (already formatted).
     /// Only wired in when the embedded inference backend is compiled.
     #[cfg(feature = "embedded-llm")]
@@ -528,6 +824,31 @@ mod ui {
 
     pub fn failure(msg: &str) {
         println!("{} {}", "✗".red().bold(), msg.red());
+    }
+
+    /// Render a self-healing progress event from the install layer. The first
+    /// line matches the spec's `[Self-Healing] … (Attempt Code: N/M)…` exactly.
+    pub fn heal_report(ev: nix_agent::install::RepairEvent) {
+        match ev {
+            nix_agent::install::RepairEvent::Attempt {
+                attempt,
+                max,
+                error,
+            } => {
+                println!(
+                    "{} Compilation failed. Initiating repair cycle (Attempt Code: {attempt}/{max})...",
+                    "[Self-Healing]".magenta().bold()
+                );
+                if let Some(e) = error {
+                    detail(&format!("error: {:?}: {}", e.kind, e.message));
+                }
+            }
+            nix_agent::install::RepairEvent::Rebuilding { attempt } => {
+                detail(&format!(
+                    "[Self-Healing] Repaired module passed the AST gate — rebuilding (attempt {attempt})..."
+                ));
+            }
+        }
     }
 
     pub fn rule() {
