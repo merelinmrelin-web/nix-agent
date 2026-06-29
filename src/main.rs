@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 
 use nix_agent::config::{AppConfig, HardwareTier};
 use nix_agent::execution::{AstOnlyBuilder, NixosRebuild};
-use nix_agent::plan::{self, ApplyOutcome, Plan, PlanOutcome};
+use nix_agent::plan::{self, Plan, PlanOutcome};
 use nix_agent::rag::{LocalLlmHealer, NixOptionIndex};
 
 #[derive(Parser)]
@@ -45,7 +45,8 @@ enum Command {
         #[arg(long)]
         model: Option<PathBuf>,
     },
-    /// Privileged: install a validated plan into the sandbox and activate it.
+    /// Privileged: install the validated module into /etc/nixos, register it in
+    /// the aggregator, and temporarily activate it (nixos-rebuild test).
     Apply {
         /// Plan id (e.g. 2026-06-29-tmux) or path to a plan file.
         #[arg(long)]
@@ -355,55 +356,102 @@ fn escalate_if_needed() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `apply` — install a validated plan into the sandbox and activate it.
+/// `apply` — install the validated module into the real system configuration
+/// (`/etc/nixos/modules/ai-generated/<id>.nix`), register it in the aggregator,
+/// verify the root config imports it, and activate via `nixos-rebuild test`.
 async fn cmd_apply(cfg: &AppConfig, plan_arg: &str) -> anyhow::Result<()> {
+    use nix_agent::install::{self, NixosApplyConfig};
+
     // Self-escalate before any output so the privileged run owns the workflow.
+    // From here on we are root, so the rebuild needs no inner `sudo`.
     escalate_if_needed()?;
+    let is_root = running_as_root();
 
     ui::banner();
 
-    ui::step(1, 2, "Loading validated plan...");
+    let apply_cfg = NixosApplyConfig::resolve();
+
+    // ── [1/3] Load + show every path apply will touch ──────────────────────
+    ui::step(1, 3, "Loading validated plan...");
     let plan = plan::load_plan(cfg, plan_arg).context("could not load the plan")?;
-    let module_path = cfg.module_path(&plan.id);
+    let module_path = apply_cfg.module_path_for(&plan.id);
     ui::detail(&format!("Plan: {}", plan.id));
     ui::detail(&format!("Target module: {}", module_path.display()));
+    ui::detail(&format!("Aggregator: {}", apply_cfg.aggregator_path.display()));
+    ui::detail(&format!(
+        "Root config: {}",
+        apply_cfg.root_config_path.display()
+    ));
+    ui::detail(&format!("Rebuild: {}", apply_cfg.rebuild_command(!is_root)));
+    println!();
 
-    // Interactive, git-style review of the change before any privileged action.
-    // The "old" side is whatever module is already installed (empty on first
-    // apply); the "new" side is the validated plan body.
+    // Interactive, git-style review against the currently-installed module.
+    let normalized = install::normalize_module(&plan.module_source)
+        .context("generated module could not be normalized into a valid NixOS module")?;
     let current = std::fs::read_to_string(&module_path).unwrap_or_default();
-    if !nix_agent::ui::render_and_confirm_plan(&current, &plan.module_source) {
+    if !nix_agent::ui::render_and_confirm_plan(&current, &normalized) {
         ui::warn("Apply cancelled. System left unchanged.");
         return Ok(());
     }
 
-    ui::step(
-        2,
-        2,
-        "Installing module and activating (nixos-rebuild test)...",
-    );
-    let mut rebuild = NixosRebuild::new(cfg.build_mode);
+    // ── [2/3] Install + register + verify root config ──────────────────────
+    ui::step(2, 3, "Registering module...");
+    let reg = install::register_module(&apply_cfg, &plan)
+        .context("could not install the generated module into the system configuration")?;
+    ui::success(&format!("Wrote module: {}", reg.module_path.display()));
+    ui::success(&format!(
+        "Registered module in: {}",
+        reg.aggregator_path.display()
+    ));
+    ui::success(&format!(
+        "Verified root config imports: {}",
+        nix_agent::install::AGGREGATOR_IMPORT
+    ));
+    println!();
+
+    // ── [3/3] Activate (test only — not the boot default) ──────────────────
+    ui::step(3, 3, "Temporarily activating...");
+    let mut rebuild = NixosRebuild::new(apply_cfg.rebuild_mode);
     rebuild.use_system_config = true;
+    rebuild.use_sudo = !is_root;
     rebuild.timeout = cfg.build_timeout;
 
-    let outcome = plan::apply_plan(cfg, &plan, rebuild)
+    install::activate(&apply_cfg, &rebuild, &reg)
         .await
-        .context("execution layer failure")?;
+        .context("nixos-rebuild failed; system left unchanged")?;
+    ui::success("Temporarily activated via nixos-rebuild test");
+    ui::detail("(`test` activates now but is NOT the boot-default generation)");
 
-    match outcome {
-        ApplyOutcome::Activated { module_path } => {
-            ui::success(&format!(
-                "Module installed and system activated: {}",
-                module_path.display()
-            ));
-            show_diff(&cfg.ai_generated_dir());
-        }
-        ApplyOutcome::Failed { reason } => {
-            ui::failure(&format!("Activation failed: {reason}"));
-            ui::detail("module rolled back; system left unchanged.");
+    // ── Postcondition: expected binaries appeared on PATH ──────────────────
+    let probe = install::FsBinaryProbe::default();
+    let report = install::verify_binaries(&probe, &reg.packages);
+    if !report.found.is_empty() {
+        ui::success("Verified binaries:");
+        for path in &report.found {
+            ui::detail(&path.display().to_string());
         }
     }
+    for missing in &report.missing {
+        ui::warn(&format!(
+            "package installed but expected binary was not found: {} (expected `{}`)",
+            missing.package, missing.binary
+        ));
+    }
+
     Ok(())
+}
+
+/// Whether the current process is root. On non-unix this is conservatively
+/// `false` (we never assume privileges we cannot check).
+fn running_as_root() -> bool {
+    #[cfg(unix)]
+    {
+        nix::unistd::getuid().is_root()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 fn plural(n: usize) -> &'static str {
@@ -439,26 +487,6 @@ fn print_plan_layout(cfg: &AppConfig, plan: &Plan, attempts: usize) {
     ));
 }
 
-/// Show a generated module's change as a `git diff`, falling back gracefully
-/// when the target is not under version control.
-fn show_diff(target: &Path) {
-    let dir = target.parent().unwrap_or_else(|| Path::new("."));
-    let result = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["--no-pager", "diff", "--"])
-        .arg(target)
-        .output();
-
-    match result {
-        Ok(out) if out.status.success() && !out.stdout.is_empty() => {
-            ui::diff_block(&String::from_utf8_lossy(&out.stdout));
-        }
-        _ => {
-            ui::detail(&format!("installed module directory: {}", target.display()));
-        }
-    }
-}
 
 /// Clean, high-level terminal output. Keeps the self-healing internals quiet,
 /// surfacing only compact step and attempt status — never raw build logs.
@@ -562,22 +590,4 @@ mod ui {
         }
     }
 
-    /// Pretty-print a unified diff with +/-/hunk coloring.
-    pub fn diff_block(diff: &str) {
-        println!("\n{}", "── resulting git diff ──".dark_grey());
-        for line in diff.lines() {
-            let styled = if line.starts_with("+++") || line.starts_with("---") {
-                line.bold().to_string()
-            } else if line.starts_with('+') {
-                line.green().to_string()
-            } else if line.starts_with('-') {
-                line.red().to_string()
-            } else if line.starts_with("@@") {
-                line.cyan().to_string()
-            } else {
-                line.dark_grey().to_string()
-            };
-            println!("{styled}");
-        }
-    }
 }

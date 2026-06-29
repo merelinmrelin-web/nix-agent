@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod config;
 pub mod execution;
+pub mod install;
 pub mod models;
 pub mod plan;
 pub mod rag;
