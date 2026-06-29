@@ -120,8 +120,9 @@ async fn cmd_plan(cfg: &AppConfig, prompt: &str) -> anyhow::Result<()> {
 
     #[cfg(feature = "embedded-llm")]
     let backend = {
-        let b = nix_agent::rag::EmbeddedLlamaBackend::load(tier, &cfg.model_cache_dir, ui::progress)
-            .context("could not initialize the local inference model")?;
+        let b =
+            nix_agent::rag::EmbeddedLlamaBackend::load(tier, &cfg.model_cache_dir, ui::progress)
+                .context("could not initialize the local inference model")?;
         ui::detail(&format!("Model ready: {}", b.model_path().display()));
         b
     };
@@ -185,7 +186,11 @@ async fn cmd_apply(cfg: &AppConfig, plan_arg: &str) -> anyhow::Result<()> {
     ui::detail(&format!("Plan: {}", plan.id));
     ui::detail(&format!("Target module: {}", module_path.display()));
 
-    ui::step(2, 2, "Installing module and activating (nixos-rebuild test)...");
+    ui::step(
+        2,
+        2,
+        "Installing module and activating (nixos-rebuild test)...",
+    );
     let mut rebuild = NixosRebuild::new(cfg.build_mode);
     rebuild.use_system_config = true;
     rebuild.timeout = cfg.build_timeout;
@@ -307,7 +312,10 @@ mod ui {
     }
 
     pub fn rule() {
-        println!("{}", "────────────────────────────────────────────".dark_grey());
+        println!(
+            "{}",
+            "────────────────────────────────────────────".dark_grey()
+        );
     }
 
     pub fn heading(text: &str) {

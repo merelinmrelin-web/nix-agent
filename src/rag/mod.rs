@@ -421,7 +421,7 @@ mod embedded {
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::params::LlamaModelParams;
-    use llama_cpp_2::model::{AddBos, LlamaModel};
+    use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
     use llama_cpp_2::sampling::LlamaSampler;
     use llama_cpp_2::token::LlamaToken;
 
@@ -478,38 +478,167 @@ mod embedded {
 
         /// Greedily generate up to `max_tokens` tokens of continuation.
         pub fn generate(&self, prompt: &str, max_tokens: usize) -> anyhow::Result<String> {
-            let n_ctx = NonZeroU32::new(8192).expect("non-zero context");
+            // Context window size, shared by the context params and the overflow
+            // guard below. Must stay in sync.
+            const N_CTX: usize = 8192;
+
+            let clean_prompt = if prompt.trim().is_empty() {
+                " "
+            } else {
+                prompt
+            };
+
+            let n_ctx = NonZeroU32::new(N_CTX as u32).expect("non-zero context");
             let ctx_params = LlamaContextParams::default().with_n_ctx(Some(n_ctx));
             let mut ctx = self.model.new_context(&self.backend, ctx_params)?;
 
-            let tokens = self.model.str_to_token(prompt, AddBos::Always)?;
-            let mut batch = LlamaBatch::new(8192, 1);
-            let last = tokens.len().saturating_sub(1);
-            for (i, tok) in tokens.iter().enumerate() {
-                batch.add(*tok, i as i32, &[0], i == last)?;
+            // Qwen2.5-Coder is an *instruct* model: it must see its ChatML
+            // framing (`<|im_start|>role … <|im_end|>`) ending with an open
+            // assistant turn. Feeding it the raw concatenated prompt leaves it
+            // with no turn to complete, and greedy decoding then collapses into
+            // repeating a single token. Let the model's own template (falling
+            // back to "chatml") build the prompt; `parse_special` in
+            // `str_to_token` turns the markers into real special tokens, and the
+            // template — not us — decides whether a BOS is prepended, so we
+            // tokenize with `AddBos::Never`.
+            let template = self
+                .model
+                .chat_template(None)
+                .or_else(|_| LlamaChatTemplate::new("chatml"))?;
+            let messages = vec![LlamaChatMessage::new(
+                "user".to_string(),
+                clean_prompt.to_string(),
+            )?];
+            let templated = self.model.apply_chat_template(&template, &messages, true)?;
+
+            let tokens = self.model.str_to_token(&templated, AddBos::Never)?;
+            if tokens.is_empty() {
+                anyhow::bail!(
+                    "Tokenizer generated 0 tokens. Ensure the RAG index is populated and prompt is valid."
+                );
             }
-            ctx.decode(&mut batch)?;
+
+            // Context guard: reject a prompt that already fills the window (no
+            // room to generate), and clamp generation to what is left.
+            let n_ctx_limit = 8192usize;
+
+            if tokens.len() >= n_ctx_limit {
+                anyhow::bail!(
+                    "Prompt is too large for context: {} tokens >= {} context tokens. Reduce RAG context or prompt size.",
+                    tokens.len(),
+                    n_ctx_limit
+                );
+            }
+
+            let max_tokens = max_tokens.min(n_ctx_limit.saturating_sub(tokens.len() + 1));
+
+            // Decode the prompt in fixed-size chunks, each with its OWN batch.
+            // llama.cpp asserts that a single batch never exceeds `n_batch`, so a
+            // long prompt must be fed incrementally while preserving absolute
+            // KV-cache positions.
+            let prompt_batch_size = 512usize;
+            let last_global = tokens.len().saturating_sub(1);
+            // Logits index of the last prompt token within the final chunk.
+            let mut last_batch_index = 0i32;
+
+            for chunk_start in (0..tokens.len()).step_by(prompt_batch_size) {
+                let chunk_end = (chunk_start + prompt_batch_size).min(tokens.len());
+                let mut prompt_batch = LlamaBatch::new(prompt_batch_size, 1);
+
+                for i in chunk_start..chunk_end {
+                    let is_last = i == last_global;
+                    prompt_batch.add(tokens[i], i as i32, &[0], is_last)?;
+                }
+
+                eprintln!(
+                    "debug: prompt decode chunk_start={} chunk_end={} batch_tokens={}",
+                    chunk_start,
+                    chunk_end,
+                    prompt_batch.n_tokens()
+                );
+
+                ctx.decode(&mut prompt_batch)?;
+                last_batch_index = prompt_batch.n_tokens() - 1;
+            }
+
+            // Absolute KV-cache position of the first generated token. Derived
+            // from the full prompt length, never from any single chunk's batch.
+            let start_pos = tokens.len() as i32;
 
             let mut sampler = LlamaSampler::greedy();
             // A single streaming decoder across the loop so multi-byte UTF-8
             // tokens are reassembled correctly.
             let mut decoder = encoding_rs::UTF_8.new_decoder();
             let mut out = String::new();
-            // Absolute KV-cache position of the first generated token.
-            let start_pos = batch.n_tokens();
+
+            // Logits index to sample from: the final prompt token first, then
+            // index 0 of each freshly decoded single-token batch thereafter.
+            let mut sample_index = last_batch_index;
 
             for i in 0..max_tokens {
-                let token: LlamaToken = sampler.sample(&ctx, batch.n_tokens() - 1);
+                let token: LlamaToken = sampler.sample(&ctx, sample_index);
                 sampler.accept(token);
+
+                let token_id = token.0;
+
+                // End-of-generation is model-defined: ask the loaded GGUF rather
+                // than hardcoding IDs, so swapping the model/quant can't silently
+                // disable the stop condition and run generation to max_tokens.
                 if self.model.is_eog_token(token) {
                     break;
                 }
-                out.push_str(&self.model.token_to_piece(token, &mut decoder, false, None)?);
 
-                batch.clear();
-                batch.add(token, start_pos + i as i32, &[0], true)?;
-                ctx.decode(&mut batch)?;
+                // Tolerant decode: skip undecodable/control tokens (chat-template
+                // markers, etc.) without crashing, but always feed the sampled
+                // token back into the context below regardless.
+                match self.model.token_to_piece(token, &mut decoder, false, None) {
+                    Ok(piece) => out.push_str(&piece),
+                    Err(_) => match self.model.token_to_piece(token, &mut decoder, true, None) {
+                        Ok(piece) => {
+                            if !matches!(
+                                piece.as_str(),
+                                "<|im_start|>"
+                                    | "<|im_end|>"
+                                    | "<|endoftext|>"
+                                    | "<|fim_prefix|>"
+                                    | "<|fim_suffix|>"
+                                    | "<|fim_middle|>"
+                                    | "<|fim_pad|>"
+                                    | "<|repo_name|>"
+                                    | "<|file_sep|>"
+                            ) {
+                                out.push_str(&piece);
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("warning: skipping undecodable token {token_id}: {err}");
+                        }
+                    },
+                }
+
+                let mut gen_batch = LlamaBatch::new(1, 1);
+                gen_batch.add(token, start_pos + i as i32, &[0], true)?;
+
+                eprintln!(
+                    "debug: gen decode i={} pos={} batch_tokens={}",
+                    i,
+                    start_pos + i as i32,
+                    gen_batch.n_tokens()
+                );
+
+                ctx.decode(&mut gen_batch)?;
+                sample_index = gen_batch.n_tokens() - 1;
             }
+
+            let out = out
+                .replace("<|im_start|>", "")
+                .replace("<|im_end|>", "")
+                .replace("<|endoftext|>", "")
+                .replace("</s>", "")
+                .replace("assistant", "")
+                .trim()
+                .to_string();
+
             Ok(out)
         }
     }
@@ -797,7 +926,11 @@ mod tests {
         idx
     }
 
-    fn build_ctx(error: NixBuildError, correlated: Option<CorrelatedNixError>, code: &str) -> HealingContext {
+    fn build_ctx(
+        error: NixBuildError,
+        correlated: Option<CorrelatedNixError>,
+        code: &str,
+    ) -> HealingContext {
         HealingContext {
             attempt: 1,
             max_attempts: 3,
@@ -869,7 +1002,10 @@ mod tests {
         idx.bootstrap().unwrap();
         let wrapped = r#"{ "options": { "networking.hostName": { "type": "string", "description": "The hostname." } } }"#;
         assert_eq!(idx.ingest_json_dump(wrapped).unwrap(), 1);
-        assert_eq!(idx.search_options("hostName", 1).unwrap()[0].attribute_path, "networking.hostName");
+        assert_eq!(
+            idx.search_options("hostName", 1).unwrap()[0].attribute_path,
+            "networking.hostName"
+        );
     }
 
     // ── prompt assembly ─────────────────────────────────────────────────────
@@ -995,9 +1131,7 @@ mod tests {
         assert!(!out.contains("```"));
 
         // The backend really received the grounded prompt.
-        let seen = healer
-            .into_captured_prompt()
-            .expect("prompt was captured");
+        let seen = healer.into_captured_prompt().expect("prompt was captured");
         assert!(seen.contains("VERIFIED NIXOS OPTIONS"));
         assert!(seen.contains("services.openssh.enable"));
     }

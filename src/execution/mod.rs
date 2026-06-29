@@ -36,9 +36,15 @@ pub const DEFAULT_BUILD_TIMEOUT: Duration = Duration::from_secs(900);
 #[derive(Debug)]
 pub enum EngineError {
     /// Failed to spawn the rebuild process (binary missing, permissions, …).
-    Spawn { program: String, source: std::io::Error },
+    Spawn {
+        program: String,
+        source: std::io::Error,
+    },
     /// Could not read/write the staged configuration file.
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     /// The build exceeded its time budget and was killed.
     Timeout { secs: u64 },
     /// The injected code generator returned an error.
@@ -537,10 +543,7 @@ impl<B: SystemBuilder> ExecutionEngine<B> {
                             previous_code: candidate.clone(),
                             failure,
                         };
-                        candidate = healer
-                            .generate(&ctx)
-                            .await
-                            .map_err(EngineError::Healer)?;
+                        candidate = healer.generate(&ctx).await.map_err(EngineError::Healer)?;
                     }
                 }
             }
@@ -617,7 +620,10 @@ impl<B: SystemBuilder> ExecutionEngine<B> {
         });
         let correlated = correlate_with_ast(&error, candidate);
 
-        Ok(AttemptResult::Failed(HealingFailure::Build { error, correlated }))
+        Ok(AttemptResult::Failed(HealingFailure::Build {
+            error,
+            correlated,
+        }))
     }
 
     fn stage_code(&self, code: &str) -> Result<(), EngineError> {
@@ -789,20 +795,20 @@ fn extract_quoted(s: &str) -> Option<String> {
 fn correlate_with_ast(error: &NixBuildError, code: &str) -> Option<CorrelatedNixError> {
     match error.kind {
         // Re-run the local parser to recover precise byte offsets `nix` doesn't give.
-        NixBuildErrorKind::Syntax => {
-            match NixFile::from_source("staged.nix", code.to_owned()) {
-                Err(NixError::Parse { diagnostics, .. }) => {
-                    Some(CorrelatedNixError::Parse { diagnostics })
-                }
-                _ => None,
+        NixBuildErrorKind::Syntax => match NixFile::from_source("staged.nix", code.to_owned()) {
+            Err(NixError::Parse { diagnostics, .. }) => {
+                Some(CorrelatedNixError::Parse { diagnostics })
             }
+            _ => None,
+        },
+        NixBuildErrorKind::MissingAttribute => {
+            error
+                .symbol
+                .as_ref()
+                .map(|attr| CorrelatedNixError::AttrNotFound {
+                    attr_path: attr.clone(),
+                })
         }
-        NixBuildErrorKind::MissingAttribute => error
-            .symbol
-            .as_ref()
-            .map(|attr| CorrelatedNixError::AttrNotFound {
-                attr_path: attr.clone(),
-            }),
         NixBuildErrorKind::TypeError => Some(CorrelatedNixError::TypeError {
             attr_path: error.symbol.clone().unwrap_or_default(),
             expected: "unknown".to_owned(),
@@ -956,8 +962,7 @@ error: undefined variable 'pkgs'
 
     #[test]
     fn parses_legacy_inline_syntax_error() {
-        let stderr =
-            "error: syntax error, unexpected '}' at /etc/nixos/configuration.nix:34:1\n";
+        let stderr = "error: syntax error, unexpected '}' at /etc/nixos/configuration.nix:34:1\n";
         let e = parse_build_stderr(stderr).expect("parsed");
         assert_eq!(e.kind, NixBuildErrorKind::Syntax);
         let loc = e.location.expect("location");
@@ -1031,7 +1036,10 @@ error: attribute 'systemPackages' missing
         let engine = ExecutionEngine::with_builder(cfg.path.clone(), AstOnlyBuilder);
         // Valid Nix passes the AST gate, the AST-only builder reports success.
         let outcome = engine.run_once(VALID.to_owned()).await.unwrap();
-        assert!(matches!(outcome, HealingOutcome::Healed { attempts: 1, .. }));
+        assert!(matches!(
+            outcome,
+            HealingOutcome::Healed { attempts: 1, .. }
+        ));
         // The staged module is on disk at the isolated path.
         assert!(cfg.path.exists());
     }
@@ -1061,7 +1069,11 @@ error: attribute 'systemPackages' missing
         let engine = ExecutionEngine::with_builder(cfg.path.clone(), builder);
         let outcome = engine.run_once(VALID.to_owned()).await.unwrap();
         match outcome {
-            HealingOutcome::Exhausted { attempts, last_failure, .. } => {
+            HealingOutcome::Exhausted {
+                attempts,
+                last_failure,
+                ..
+            } => {
                 assert_eq!(attempts, 1);
                 assert!(matches!(last_failure, HealingFailure::Build { .. }));
             }
@@ -1104,8 +1116,8 @@ error: attribute 'systemPackages' missing
             fail_build("error: undefined variable 'b' at /x.nix:1:1\n"),
             fail_build("error: undefined variable 'c' at /x.nix:1:1\n"),
         ]);
-        let engine = ExecutionEngine::with_builder(cfg.path.clone(), builder)
-            .restore_on_failure(false);
+        let engine =
+            ExecutionEngine::with_builder(cfg.path.clone(), builder).restore_on_failure(false);
         // Two regenerations between three attempts.
         let mut healer = ScriptedHealer::new(vec![VALID, VALID]);
 
@@ -1115,7 +1127,11 @@ error: attribute 'systemPackages' missing
             .expect("no infra error");
 
         match outcome {
-            HealingOutcome::Exhausted { attempts, last_failure, .. } => {
+            HealingOutcome::Exhausted {
+                attempts,
+                last_failure,
+                ..
+            } => {
                 assert_eq!(attempts, 3);
                 assert!(matches!(last_failure, HealingFailure::Build { .. }));
             }
@@ -1145,12 +1161,17 @@ error: attribute 'systemPackages' missing
             other => panic!("expected Ast failure first, got {:?}", other),
         }
         // Builder only ran once — for the valid second candidate.
-        assert!(matches!(outcome, HealingOutcome::Healed { attempts: 2, .. }));
+        assert!(matches!(
+            outcome,
+            HealingOutcome::Healed { attempts: 2, .. }
+        ));
         assert_eq!(*engine_builder_calls(&engine), 1);
     }
 
     // Helper to peek at the scripted builder's call count through the engine.
-    fn engine_builder_calls(engine: &ExecutionEngine<ScriptedBuilder>) -> std::sync::MutexGuard<'_, usize> {
+    fn engine_builder_calls(
+        engine: &ExecutionEngine<ScriptedBuilder>,
+    ) -> std::sync::MutexGuard<'_, usize> {
         engine_builder(engine).calls.lock().unwrap()
     }
     fn engine_builder(engine: &ExecutionEngine<ScriptedBuilder>) -> &ScriptedBuilder {

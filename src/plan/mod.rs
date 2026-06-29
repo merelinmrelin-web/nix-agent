@@ -22,14 +22,20 @@ use crate::execution::{
 
 #[derive(Debug)]
 pub enum PlanError {
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     Engine(EngineError),
     /// The plan file did not contain the expected header.
     Malformed(String),
     /// No plan could be resolved from the given path or id.
     NotFound(String),
     /// The requested id did not match the id stored in the plan file.
-    IdMismatch { requested: String, found: String },
+    IdMismatch {
+        requested: String,
+        found: String,
+    },
 }
 
 impl std::fmt::Display for PlanError {
@@ -40,7 +46,11 @@ impl std::fmt::Display for PlanError {
             Self::Malformed(m) => write!(f, "malformed plan file: {}", m),
             Self::NotFound(a) => write!(f, "no plan found for '{}'", a),
             Self::IdMismatch { requested, found } => {
-                write!(f, "no plan with id '{}' (latest plan is '{}')", requested, found)
+                write!(
+                    f,
+                    "no plan with id '{}' (latest plan is '{}')",
+                    requested, found
+                )
             }
         }
     }
@@ -123,12 +133,17 @@ impl Plan {
             }
         }
 
-        let id = id.ok_or_else(|| PlanError::Malformed("missing `# plan-id:` header".to_owned()))?;
+        let id =
+            id.ok_or_else(|| PlanError::Malformed("missing `# plan-id:` header".to_owned()))?;
         let mut module_source = body_lines.join("\n");
         if !module_source.ends_with('\n') {
             module_source.push('\n');
         }
-        Ok(Plan { id, prompt, module_source })
+        Ok(Plan {
+            id,
+            prompt,
+            module_source,
+        })
     }
 }
 
@@ -174,8 +189,26 @@ fn ymd_from_unix(secs: i64) -> (i64, u32, u32) {
 /// Up to two salient lowercase tokens from the prompt, joined with `-`.
 fn derive_slug(prompt: &str) -> String {
     const STOP: &[&str] = &[
-        "add", "install", "enable", "disable", "remove", "with", "the", "and", "or", "custom",
-        "configure", "config", "set", "setup", "for", "please", "make", "use", "using", "that",
+        "add",
+        "install",
+        "enable",
+        "disable",
+        "remove",
+        "with",
+        "the",
+        "and",
+        "or",
+        "custom",
+        "configure",
+        "config",
+        "set",
+        "setup",
+        "for",
+        "please",
+        "make",
+        "use",
+        "using",
+        "that",
     ];
     let mut parts: Vec<String> = Vec::new();
     for tok in prompt.split(|c: char| !c.is_ascii_alphanumeric()) {
@@ -242,7 +275,11 @@ where
             write_file(&cfg.plan_file, &plan.render())?;
             Ok(PlanOutcome::Validated { plan, attempts })
         }
-        HealingOutcome::Exhausted { attempts, last_failure, .. } => Ok(PlanOutcome::Rejected {
+        HealingOutcome::Exhausted {
+            attempts,
+            last_failure,
+            ..
+        } => Ok(PlanOutcome::Rejected {
             reason: last_failure.short_summary(),
             attempts,
         }),
@@ -281,8 +318,8 @@ pub fn load_plan(cfg: &AppConfig, arg: &str) -> Result<Plan, PlanError> {
         return Plan::parse(&content);
     }
 
-    let content = std::fs::read_to_string(&cfg.plan_file)
-        .map_err(|_| PlanError::NotFound(arg.to_owned()))?;
+    let content =
+        std::fs::read_to_string(&cfg.plan_file).map_err(|_| PlanError::NotFound(arg.to_owned()))?;
     let plan = Plan::parse(&content)?;
     if plan.id != arg {
         return Err(PlanError::IdMismatch {
@@ -379,7 +416,12 @@ mod tests {
     }
 
     fn ok_build() -> BuildOutput {
-        BuildOutput { success: true, exit_code: Some(0), stdout: String::new(), stderr: String::new() }
+        BuildOutput {
+            success: true,
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        }
     }
     fn fail_build() -> BuildOutput {
         BuildOutput {
@@ -411,7 +453,10 @@ mod tests {
     #[test]
     fn slug_skips_stopwords() {
         assert_eq!(derive_slug("add tmux"), "tmux");
-        assert_eq!(derive_slug("install firefox and enable bluetooth"), "firefox-bluetooth");
+        assert_eq!(
+            derive_slug("install firefox and enable bluetooth"),
+            "firefox-bluetooth"
+        );
         assert_eq!(derive_slug("enable the"), "");
     }
 
@@ -467,7 +512,10 @@ mod tests {
     async fn create_plan_validates_and_writes_plan_file() {
         let dir = TempDir::new("create-ok");
         let cfg = cfg_in(&dir.path);
-        let mut healer = FixedHealer { reply: String::new(), calls: Mutex::new(0) };
+        let mut healer = FixedHealer {
+            reply: String::new(),
+            calls: Mutex::new(0),
+        };
 
         let outcome = create_plan(
             &cfg,
@@ -500,8 +548,11 @@ mod tests {
     async fn create_plan_rejects_unrepairable_module() {
         let dir = TempDir::new("create-bad");
         let cfg = cfg_in(&dir.path); // max_attempts = 2
-        // Healer keeps returning broken Nix → AST gate never passes.
-        let mut healer = FixedHealer { reply: "{ foo = ;".to_owned(), calls: Mutex::new(0) };
+                                     // Healer keeps returning broken Nix → AST gate never passes.
+        let mut healer = FixedHealer {
+            reply: "{ foo = ;".to_owned(),
+            calls: Mutex::new(0),
+        };
 
         let outcome = create_plan(
             &cfg,
@@ -564,9 +615,15 @@ mod tests {
             module_source: VALID_MODULE.to_owned(),
         };
 
-        let outcome = apply_plan(&cfg, &plan, FixedBuilder { output: fail_build() })
-            .await
-            .unwrap();
+        let outcome = apply_plan(
+            &cfg,
+            &plan,
+            FixedBuilder {
+                output: fail_build(),
+            },
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(outcome, ApplyOutcome::Failed { .. }));
         // Rollback removed the installed module.

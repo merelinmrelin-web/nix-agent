@@ -1,4 +1,7 @@
-use std::{fmt, io, path::{Path, PathBuf}};
+use std::{
+    fmt, io,
+    path::{Path, PathBuf},
+};
 
 use rnix::ast::{self, HasEntry};
 use rowan::ast::AstNode;
@@ -18,15 +21,29 @@ pub struct ParseDiagnostic {
 
 #[derive(Debug)]
 pub enum NixError {
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
     /// AST is malformed — self-healing loop should trigger re-generation.
-    Parse { path: PathBuf, diagnostics: Vec<ParseDiagnostic> },
+    Parse {
+        path: PathBuf,
+        diagnostics: Vec<ParseDiagnostic>,
+    },
     /// The requested dotted path does not exist in the file.
-    AttrNotFound { attr_path: String },
+    AttrNotFound {
+        attr_path: String,
+    },
     /// The node exists but has the wrong value type for the requested operation.
-    TypeError { attr_path: String, expected: &'static str },
+    TypeError {
+        attr_path: String,
+        expected: &'static str,
+    },
     /// Package name not present in the target list.
-    PackageNotFound { attr_path: String, package: String },
+    PackageNotFound {
+        attr_path: String,
+        package: String,
+    },
 }
 
 impl fmt::Display for NixError {
@@ -45,7 +62,10 @@ impl fmt::Display for NixError {
             Self::AttrNotFound { attr_path } => {
                 write!(f, "attribute '{}' not found", attr_path)
             }
-            Self::TypeError { attr_path, expected } => {
+            Self::TypeError {
+                attr_path,
+                expected,
+            } => {
                 write!(f, "'{}' is not a {}", attr_path, expected)
             }
             Self::PackageNotFound { attr_path, package } => {
@@ -121,9 +141,7 @@ impl NixFile {
                     ParseError::UnexpectedWanted(_, r, _) => {
                         (u32::from(r.start()), u32::from(r.end()))
                     }
-                    ParseError::DuplicatedArgs(r, _) => {
-                        (u32::from(r.start()), u32::from(r.end()))
-                    }
+                    ParseError::DuplicatedArgs(r, _) => (u32::from(r.start()), u32::from(r.end())),
                     // EOF variants have no meaningful byte position.
                     _ => (0, 0),
                 };
@@ -139,7 +157,11 @@ impl NixFile {
             return Err(NixError::Parse { path, diagnostics });
         }
 
-        Ok(Self { path, source, root: parse.tree() })
+        Ok(Self {
+            path,
+            source,
+            root: parse.tree(),
+        })
     }
 
     pub fn source(&self) -> &str {
@@ -161,11 +183,7 @@ impl NixFile {
 
     /// Return new source with `package` appended to the list at `attr_path`.
     /// Handles both `[ a b ]` and `with pkgs; [ a b ]` forms.
-    pub fn append_package(
-        &self,
-        attr_path: &[&str],
-        package: &str,
-    ) -> Result<String, NixError> {
+    pub fn append_package(&self, attr_path: &[&str], package: &str) -> Result<String, NixError> {
         let list_node = self.resolve_list_node(attr_path)?;
         let range = list_node.text_range();
         let abs_start = usize::from(range.start());
@@ -200,14 +218,10 @@ impl NixFile {
     }
 
     /// Return new source with `package` removed from the list at `attr_path`.
-    pub fn remove_package(
-        &self,
-        attr_path: &[&str],
-        package: &str,
-    ) -> Result<String, NixError> {
+    pub fn remove_package(&self, attr_path: &[&str], package: &str) -> Result<String, NixError> {
         let list_node = self.resolve_list_node(attr_path)?;
-        let list = ast::List::cast(list_node.clone())
-            .expect("resolve_list_node guarantees a List node");
+        let list =
+            ast::List::cast(list_node.clone()).expect("resolve_list_node guarantees a List node");
 
         let item = list
             .items()
@@ -236,11 +250,7 @@ impl NixFile {
     }
 
     /// Return new source with the boolean at `attr_path` set to `value`.
-    pub fn set_bool(
-        &self,
-        attr_path: &[&str],
-        value: bool,
-    ) -> Result<String, NixError> {
+    pub fn set_bool(&self, attr_path: &[&str], value: bool) -> Result<String, NixError> {
         let node = self.resolve_value_node(attr_path)?;
         if !matches!(classify_value(&node), NixValue::Bool(_)) {
             return Err(NixError::TypeError {
@@ -259,11 +269,7 @@ impl NixFile {
 
     /// Return new source with the string at `attr_path` set to `value`
     /// (properly escaped and quoted).
-    pub fn set_string(
-        &self,
-        attr_path: &[&str],
-        value: &str,
-    ) -> Result<String, NixError> {
+    pub fn set_string(&self, attr_path: &[&str], value: &str) -> Result<String, NixError> {
         let node = self.resolve_value_node(attr_path)?;
         if !matches!(classify_value(&node), NixValue::Str(_)) {
             return Err(NixError::TypeError {
@@ -283,7 +289,10 @@ impl NixFile {
 
     // ── Internal resolution ───────────────────────────────────────────────────
 
-    fn resolve_value_node(&self, attr_path: &[&str]) -> Result<rowan::SyntaxNode<rnix::NixLanguage>, NixError> {
+    fn resolve_value_node(
+        &self,
+        attr_path: &[&str],
+    ) -> Result<rowan::SyntaxNode<rnix::NixLanguage>, NixError> {
         let top = top_level_attrset(&self.root).ok_or_else(|| NixError::AttrNotFound {
             attr_path: attr_path.join("."),
         })?;
@@ -292,7 +301,10 @@ impl NixFile {
         })
     }
 
-    fn resolve_list_node(&self, attr_path: &[&str]) -> Result<rowan::SyntaxNode<rnix::NixLanguage>, NixError> {
+    fn resolve_list_node(
+        &self,
+        attr_path: &[&str],
+    ) -> Result<rowan::SyntaxNode<rnix::NixLanguage>, NixError> {
         let value = self.resolve_value_node(attr_path)?;
         unwrap_to_list(&value).ok_or_else(|| NixError::TypeError {
             attr_path: attr_path.join("."),
@@ -338,11 +350,7 @@ fn find_value_in_attrset(attrset_node: &SyntaxNode, path: &[&str]) -> Option<Syn
         let ast::Entry::AttrpathValue(kv) = entry else {
             continue;
         };
-        let key_parts: Vec<String> = kv
-            .attrpath()?
-            .attrs()
-            .filter_map(attr_ident_text)
-            .collect();
+        let key_parts: Vec<String> = kv.attrpath()?.attrs().filter_map(attr_ident_text).collect();
 
         if key_parts.is_empty() {
             continue;
@@ -395,13 +403,11 @@ fn attr_ident_text(attr: ast::Attr) -> Option<String> {
 /// for the current operation set.
 fn classify_value(node: &SyntaxNode) -> NixValue {
     match ast::Expr::cast(node.clone()) {
-        Some(ast::Expr::Ident(id)) => {
-            match id.ident_token().as_ref().map(|t| t.text()) {
-                Some("true") => NixValue::Bool(true),
-                Some("false") => NixValue::Bool(false),
-                _ => NixValue::Opaque(node.text().to_string()),
-            }
-        }
+        Some(ast::Expr::Ident(id)) => match id.ident_token().as_ref().map(|t| t.text()) {
+            Some("true") => NixValue::Bool(true),
+            Some("false") => NixValue::Bool(false),
+            _ => NixValue::Opaque(node.text().to_string()),
+        },
         Some(ast::Expr::Str(s)) => {
             // Collect the inner text of a double-quoted string, stripping quotes.
             let raw = s.syntax().text().to_string();
@@ -420,9 +426,7 @@ fn classify_value(node: &SyntaxNode) -> NixValue {
             }
             NixValue::Opaque(node.text().to_string())
         }
-        Some(ast::Expr::List(list)) => {
-            NixValue::PackageList(list_items_as_strings(&list))
-        }
+        Some(ast::Expr::List(list)) => NixValue::PackageList(list_items_as_strings(&list)),
         Some(ast::Expr::With(with)) => {
             if let Some(ast::Expr::List(list)) = with.body() {
                 return NixValue::PackageList(list_items_as_strings(&list));
@@ -472,10 +476,7 @@ fn detect_list_item_indent(list_src: &str) -> Option<&str> {
     let after_open = list_src.strip_prefix('[')?;
     let nl_pos = after_open.find('\n')?;
     let rest = &after_open[nl_pos + 1..];
-    let indent_len = rest
-        .chars()
-        .take_while(|c| *c == ' ' || *c == '\t')
-        .count();
+    let indent_len = rest.chars().take_while(|c| *c == ' ' || *c == '\t').count();
     Some(&rest[..indent_len])
 }
 
@@ -489,7 +490,7 @@ fn nix_escape_string(s: &str) -> String {
             '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
-            '$' => out.push_str("\\$"),  // prevent Nix string interpolation
+            '$' => out.push_str("\\$"), // prevent Nix string interpolation
             c => out.push(c),
         }
     }

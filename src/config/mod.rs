@@ -281,14 +281,32 @@ mod tests {
     fn tier_mapping_respects_thresholds() {
         let gib = |g: u64| g * BYTES_PER_GIB;
         // High-end: at and above 16 GiB.
-        assert_eq!(HardwareTier::from_total_ram_bytes(gib(32)), HardwareTier::HighEnd);
-        assert_eq!(HardwareTier::from_total_ram_bytes(gib(16)), HardwareTier::HighEnd);
+        assert_eq!(
+            HardwareTier::from_total_ram_bytes(gib(32)),
+            HardwareTier::HighEnd
+        );
+        assert_eq!(
+            HardwareTier::from_total_ram_bytes(gib(16)),
+            HardwareTier::HighEnd
+        );
         // Medium: [8, 16) GiB.
-        assert_eq!(HardwareTier::from_total_ram_bytes(gib(16) - 1), HardwareTier::Medium);
-        assert_eq!(HardwareTier::from_total_ram_bytes(gib(8)), HardwareTier::Medium);
+        assert_eq!(
+            HardwareTier::from_total_ram_bytes(gib(16) - 1),
+            HardwareTier::Medium
+        );
+        assert_eq!(
+            HardwareTier::from_total_ram_bytes(gib(8)),
+            HardwareTier::Medium
+        );
         // Low: below 8 GiB (older machines, CPU-only).
-        assert_eq!(HardwareTier::from_total_ram_bytes(gib(8) - 1), HardwareTier::Low);
-        assert_eq!(HardwareTier::from_total_ram_bytes(gib(4)), HardwareTier::Low);
+        assert_eq!(
+            HardwareTier::from_total_ram_bytes(gib(8) - 1),
+            HardwareTier::Low
+        );
+        assert_eq!(
+            HardwareTier::from_total_ram_bytes(gib(4)),
+            HardwareTier::Low
+        );
         assert_eq!(HardwareTier::from_total_ram_bytes(0), HardwareTier::Low);
     }
 

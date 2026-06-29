@@ -33,12 +33,15 @@
             # The embedded inference stack additionally needs these to build:
             pkgs.rustPlatform.bindgenHook  # libclang for llama-cpp-sys bindgen
             pkgs.shaderc                   # glslc, compiles GGML's Vulkan shaders
-            pkgs.vulkan-headers            # Vulkan headers for the GGML backend
           ];
 
           buildInputs = [
             pkgs.vulkan-loader
-            pkgs.openssl
+
+            pkgs.vulkan-headers  # CMake FindVulkan needs these on the target include path
+            pkgs.spirv-headers   # GGML's Vulkan backend find_package(SPIRV-Headers)
+            pkgs.spirv-tools     # …and links the SPIR-V optimizer alongside it
+            pkgs.openssl         # openssl-sys (hf-hub → reqwest/native-tls) links against it
           ];
 
           # Force the in-process GGUF inference engine with the Vulkan backend.
